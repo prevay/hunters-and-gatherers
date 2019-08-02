@@ -231,7 +231,9 @@ def a2c_multi(env_pol_list, n_episodes, batch_size, gamma, lr):
         for i, agent in enumerate(env_optim_list):
             own_locs = deepcopy(agent_locs)
             _ = own_locs.pop(i)
-            agent['env'].add_others_locs(own_locs)
+            ids = list(range(len(env_optim_list)))
+            _ = ids.pop(i)
+            agent['env'].add_others(own_locs, ids)
             agent['env'].id = i
 
 
@@ -309,6 +311,111 @@ def a2c_multi(env_pol_list, n_episodes, batch_size, gamma, lr):
                 agent['batch_actions'] = []
                 # TODO: should I be clearing the batch values as well?
                 agent['batch_counter'] = 1
+
+    return env_pol_list
+
+def a2c_evolution(env_pol_list, maxt, gd_int, repr_int,  gamma, lr):
+
+    env_optim_list = []
+
+    id_counter = len(env_pol_list)
+
+    for actor, critic, env in env_pol_list:
+        actor_optimizer = optim.Adam(actor.parameters(), lr=lr)
+        critic_optimizer = optim.Adam(critic.parameters(), lr=lr)
+        env_optim_list.append(dict(actor=actor,
+                                   critic=critic,
+                                   actor_optimizer=actor_optimizer,
+                                   critic_optimizer=critic_optimizer,
+                                   env=env,
+                                   total_rewards=[],
+                                   states=[],
+                                   actions=[],
+                                   rewards=[],
+                                   values=[],
+                                   done=False))
+
+    n_dir_perms = math.factorial(len([- 1, 0, 1]))
+
+    shared_env = shared_env_updates.init_plants(np.random.randint(2, 9))  # TODO: remove hard-coded stuff
+    for agent in env_optim_list:
+        agent['current_state'] = agent['env'].reset(shared_env)
+
+    agent_locs = [agent['env'].loc for agent in env_optim_list]
+
+    for i, agent in enumerate(env_optim_list):
+        own_locs = deepcopy(agent_locs)
+        _ = own_locs.pop(i)
+        ids = list(range(len(env_optim_list)))
+        _ = ids.pop(i)
+        agent['env'].add_others(own_locs, ids)
+        agent['env'].id = i
+
+
+    for _ in range(maxt):
+
+        n_entity_perms = math.factorial(len(env_optim_list))
+
+        for agent in env_optim_list:
+            action_probs = agent['actor'](torch.FloatTensor(agent['current_state']))
+            agent['action'] = np.random.choice(agent['env'].action_space.n,
+                                      p=action_probs[0].detach().numpy())
+            value = agent['critic'](torch.FloatTensor(agent['current_state']))
+            agent['actions'].append(agent['action'])
+            agent['values'].append(value)
+            agent['states'].append(agent['current_state'])
+
+        # TODO: how to handle dead agents?
+        entity_perm = np.random.randint(n_entity_perms)
+        dir_perms = [[np.random.randint(n_dir_perms), np.random.randint(n_dir_perms)] for _ in env_optim_list]
+        shared_env = shared_env_updates.step_vegetation(shared_env)
+        actions = [[agent['action'] for agent in env_optim_list], dir_perms, entity_perm, deepcopy(shared_env)]
+
+        env_optim_list, id_counter, shared_env, dead = step_all(env_optim_list, actions, id_counter, repr_int, lr)
+
+        for agent in env_optim_list:
+            if agent['env'].t % gd_int == 0 and agent['env'].t > 0:
+                agent['actor_optimizer'].zero_grad()
+                agent['critic_optimizer'].zero_grad()
+                state_tensor = torch.FloatTensor(agent['states'])
+                action_tensor = torch.LongTensor(agent['actions'])
+                reward_tensor = torch.FloatTensor(agent['rewards'])
+                value_tensor = agent['critic'](state_tensor)
+
+                log_ps = torch.log(agent['actor'](state_tensor))
+
+                action_log_ps = log_ps[np.arange(len(action_tensor)), action_tensor]
+
+                advantages = reward_tensor - value_tensor
+
+                action_log_ps_x_rewards = action_log_ps * advantages.detach()
+
+                actor_loss = -action_log_ps_x_rewards.mean()
+                critic_loss = advantages.pow(2).mean()
+
+                actor_loss.backward()
+                critic_loss.backward()
+
+                agent['actor_optimizer'].step()
+                agent['critic_optimizer'].step()
+
+                # Print some info every now and then:
+
+                # TODO: perhaps keep a rolling window of some history?
+                agent['rewards'] = []
+                agent['states'] = []
+                agent['actions'] = []
+                agent['values'] = []
+
+        if not env_optim_list:
+            agent = dead[np.random.randint(len(dead))]
+            agent['current_state'] = agent['env'].reset(shared_env)
+            agent['done'] = False
+            agent['rewards'] = []
+            agent['states'] = []
+            agent['actions'] = []
+            agent['values'] = []
+            env_optim_list.append(agent)
 
 
 def reinforce(env, pol, n_episodes, batch_size, gamma, lr):
@@ -468,7 +575,7 @@ def test_social_forager(env, policy, n_episodes):
     print('StDev Episode reward: {0}'.format(np.std(ep_rewards)))
 
 
-def test_multi_forager(env_pol_list, n_episodes):
+def test_multi_forager(env_pol_list, max_t, repr_int):
     action_names = {0: 'Up',
                     1: 'Right',
                     2: 'Down',
@@ -478,93 +585,150 @@ def test_multi_forager(env_pol_list, n_episodes):
 
     agent_list = []
     n_dir_perms = math.factorial(len([- 1, 0, 1]))
-    n_entity_perms = math.factorial(len(env_pol_list))
+    id_counter = len(env_pol_list)
 
     for actor, _, env in env_pol_list:
         agent = dict(env=env,
-                     pol=actor,
+                     actor=actor,
                      done=False,
-                     state=None,
+                     current_state=None,
                      action=None,
                      reward=0,
-                     ep_reward=0)
+                     ep_reward=0
+                     )
         agent_list.append(agent)
 
-    ep_rewards = [[], []]
-    for ep in range(n_episodes):
-        print('BEGINING NEW EPISODE:')
-        shared_env = shared_env_updates.init_plants(np.random.randint(2, 9))  # TODO: remove hard-coded stuff
+    print('BEGINING NEW EPISODE:')
+    shared_env = shared_env_updates.init_plants(np.random.randint(2, 9))  # TODO: remove hard-coded stuff
 
-        for agent in agent_list:
-            agent['state'] = agent['env'].reset(shared_env)
+    for agent in agent_list:
+        agent['current_state'] = agent['env'].reset(shared_env)
+        agent['done'] = False
+        agent['ep_reward'] = 0
+    agent_locs = [agent['env'].loc for agent in agent_list]
+
+    symbols = 'XY'
+    for i, agent in enumerate(agent_list):
+        own_locs = deepcopy(agent_locs)
+        _ = own_locs.pop(i)
+        ids = list(range(len(agent_list)))
+        _ = ids.pop(i)
+        agent['env'].others = []
+        agent['env'].add_others(own_locs, ids)
+        agent['env'].id = i
+        agent['symbol'] = symbols[i]
+
+    ep_rewards = [[], []]
+    for _ in range(max_t):
+
+        n_entity_perms = math.factorial(len(agent_list))
+
+        print("\n\nMAP OF FORAGE WORLD:")
+        rows = []
+        for y in reversed(range(7)):
+            row = []
+            for x in range(7):
+                row.append(
+                    shared_env.get((x, y), 0))
+            rows.append(row)
+
+        hps = []
+        locs = []
+        for i, agent in enumerate(agent_list):
+            rows[-agent['env'].loc[1]-1][agent['env'].loc[0]] = agent['symbol']
+            hps.append(agent['env'].hp)
+            locs.append(agent['env'].loc)
+        for row in rows:
+            print(row)
+        for i, agent in enumerate(agent_list):
+            print('Agent {0} {1} HP: {2}'.format(agent['symbol'], locs[i], hps[i]))
+
+        actions = []
+        for i, agent in enumerate(agent_list):
+            action_probs = agent['actor'](torch.FloatTensor(agent['current_state']))
+            action = np.argmax(action_probs.detach().numpy())
+            actions.append(action)
+            print('{0} Action: {1}'.format(agent['symbol'], action_names[action]))
+
+        entity_perm = np.random.randint(n_entity_perms)
+        dir_perms = [[np.random.randint(n_dir_perms), np.random.randint(n_dir_perms)] for _ in agent_list]
+        shared_env = shared_env_updates.step_vegetation(shared_env)
+        actions = [actions, dir_perms, entity_perm, deepcopy(shared_env)]
+
+
+        agent_list, id_counter, shared_env, dead = step_all(agent_list, actions, id_counter, repr_int)
+
+        if not agent_list:
+            print('All agents dead. Spawning an additional single agent')
+            agent = dead[np.random.randint(len(dead))]
+            agent['current_state'] = agent['env'].reset(shared_env)
+            agent['reward'] = []
+            agent['action'] = []
             agent['done'] = False
             agent['ep_reward'] = 0
-        agent_locs = [agent['env'].loc for agent in agent_list]
-
-        for i, agent in enumerate(agent_list):
-            own_locs = deepcopy(agent_locs)
-            _ = own_locs.pop(i)
-            agent['env'].add_others_locs(own_locs)
-            agent['env'].id = i
+            agent_list.append(agent)
 
 
-        while not all([agent['done'] for agent in agent_list]):
-            entity_perm = np.random.randint(n_entity_perms)
-            dir_perms = [[np.random.randint(n_dir_perms), np.random.randint(n_dir_perms)] for _ in agent_list]
-            shared_env = shared_env_updates.step_vegetation(shared_env)
-            print("\n\nMAP OF FORAGE WORLD:")
-            rows = []
-            for y in reversed(range(7)):
-                row = []
-                for x in range(7):
-                    row.append(
-                        shared_env.get((x, y), 0))
-                rows.append(row)
+def step_all(agents, actions, id_counter, repr_int, lr=None):
 
-            symbols = 'XY'
-            hps = []
-            for i, agent in enumerate(agent_list):
-                if not agent['done']:
-                    rows[-agent['env'].loc[1]-1][agent['env'].loc[0]] = symbols[i]
-                hps.append(agent['env'].hp)
-            for row in rows:
-                print(row)
-            for i, agent in enumerate(agent_list):
-                print('Agent {0} HP: {1}'.format(symbols[i], hps[i]))
+    new_clones = []
+    dead = []
 
-            actions = []
-            for i, agent in enumerate(agent_list):
-                action_probs = agent['pol'](torch.FloatTensor(agent['state']))
-                action = np.argmax(action_probs.detach().numpy())
-                actions.append(action)
-                if not agent['done']:
-                    print('{0} Action: {1}'.format(symbols[i], action_names[action]))
-                else:
-                    print('{0} Action: None (Dead)'.format(symbols[i]))
+    for i, agent in enumerate(agents):
+        agent_actions = deepcopy(actions)
+        for j in range(2):
+            own = agent_actions[j].pop(i)
+            agent_actions[j] = [own, *agent_actions[j]]
+        new_state, reward, done, _ = agent['env'].step(agent_actions)
+        if lr:
+            agent['rewards'].append(reward)
+        else:
+            agent['reward'] = reward
+        agent['done'] = done
+        agent['current_state'] = new_state
+        shared_env = agent['env'].plants
+        # check if done and remove
+        if agent['done']:
+            dead.append(agent)
+        # check if reproduction occurs:
+        if agent['env'].t % repr_int == 0:
+            clone_actor = deepcopy(agent['actor'])
+            clone_env = deepcopy(agent['env'])
+            current_state = clone_env.reset(id=id_counter)
+            if lr:
+                clone_critic = deepcopy(agent['critic'])
+                clone_actor_optimizer = optim.Adam(clone_actor.parameters(), lr=lr)
+                clone_critic_optimizer = optim.Adam(clone_critic.parameters(), lr=lr)
+                clone_agent = dict(actor=clone_actor,
+                                   critic=clone_critic,
+                                   actor_optimizer=clone_actor_optimizer,
+                                   critic_optimizer=clone_critic_optimizer,
+                                   env=clone_env,
+                                   total_rewards=[],
+                                   states=[],
+                                   actions=[],
+                                   rewards=[],
+                                   values=[],
+                                   current_state=current_state,
+                                   done=False)
+            else:
+                clone_agent = dict(env=clone_env,
+                                   actor=clone_actor,
+                                   current_state=current_state,
+                                   action=None,
+                                   reward=None,
+                                   ep_reward=0,
+                                   symbol=agent['symbol'],
+                                   done=False)
+            new_clones.append(clone_agent)
+            for i, agent in enumerate(agents):
+                agent['env'].add_others([clone_agent['env'].loc], [id_counter])
+            id_counter += 1
+    agents.extend(new_clones)
+    agents = [agent for agent in agents if agent not in dead]
 
-            actions = [actions, dir_perms, entity_perm, deepcopy(shared_env)]
+    return agents, id_counter, shared_env, dead
 
-            for i, agent in enumerate(agent_list):
-                agent_actions = deepcopy(actions)
-                for j in range(2):
-                    own = agent_actions[j].pop(i)
-                    agent_actions[j] = [own, *agent_actions[j]]
-                if not agent['done']:
-                    new_state, reward, done, _ = agent['env'].step(agent_actions)
-                    agent['reward'] = reward
-                    agent['done'] = done
-                    agent['state'] = new_state
-                    agent['ep_reward'] += reward
-                    shared_env = agent['env'].plants
-
-
-        for i, agent in enumerate(agent_list):
-            print('{0} Episode reward: {1}'.format(symbols[i], agent['ep_reward']))
-            ep_rewards[i].append(agent['ep_reward'])
-
-    for i, agent in enumerate(agent_list):
-        print('{0} Mean Episode reward: {1}'.format(symbols[i], np.mean(ep_rewards[i])))
-        print('{0} StDev Episode reward: {1}'.format(symbols[i], np.std(ep_rewards[i])))
 
 
 def discount_rewards(reward_list, gamma):
@@ -598,11 +762,20 @@ if __name__ == '__main__':
 
     env_pol_list = [(actor1, critic1, world1), (actor2, critic2, world2)]
 
-    a2c_multi(env_pol_list,
-              n_episodes=50000,
-              batch_size=200,
-              gamma=0.99,
-              lr=0.001)
+    env_pol_list = a2c_multi(env_pol_list,
+                             n_episodes=5000,
+                             batch_size=200,
+                             gamma=0.99,
+                             lr=0.001)
 
-    test_multi_forager(env_pol_list, n_episodes=10)
+
+    a2c_evolution(env_pol_list,
+                  maxt=50000,
+                  repr_int=10,
+                  gd_int=100,
+                  gamma=0.99,
+                  lr=0.001)
+
+    test_multi_forager(env_pol_list, max_t=100, repr_int=10)
+
 
